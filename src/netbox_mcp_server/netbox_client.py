@@ -172,6 +172,7 @@ class NetBoxRestClient(NetBoxClientBase):
         """
         self.base_url = url.rstrip("/")
         self.api_url = f"{self.base_url}/api"
+        self.graphql_url = f"{self.base_url}/graphql/"
         self.token = token
         self.verify_ssl = verify_ssl
         self.session = requests.Session()
@@ -182,6 +183,46 @@ class NetBoxRestClient(NetBoxClientBase):
                 "Accept": "application/json",
             }
         )
+
+    def graphql(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        operation_name: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Execute a GraphQL query against NetBox.
+
+        NetBox serves GraphQL at /graphql/ (same host, not under /api/).
+        Returns the `data` payload; raises on HTTP errors or GraphQL-level errors.
+
+        Args:
+            query: GraphQL query document
+            variables: Optional variables dict
+            operation_name: Optional operation name (required for multi-op docs)
+
+        Returns:
+            The `data` portion of the GraphQL response
+
+        Raises:
+            requests.HTTPError: If the HTTP request fails
+            ValueError: If the GraphQL response contains errors
+        """
+        body: dict[str, Any] = {"query": query}
+        if variables is not None:
+            body["variables"] = variables
+        if operation_name is not None:
+            body["operationName"] = operation_name
+
+        response = self.session.post(self.graphql_url, json=body, verify=self.verify_ssl)
+        response.raise_for_status()
+        payload = response.json()
+
+        if payload.get("errors"):
+            messages = [err.get("message", str(err)) for err in payload["errors"]]
+            raise ValueError(f"GraphQL errors: {'; '.join(messages)}")
+
+        return payload.get("data", {})
 
     def _build_url(self, endpoint: str, id: int | None = None) -> str:
         """Build the full URL for an API request."""

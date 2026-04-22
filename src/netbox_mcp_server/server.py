@@ -78,6 +78,22 @@ def parse_cli_args() -> dict[str, Any]:
         help="Auto-discover plugin object types from NetBox at startup",
     )
 
+    # GraphQL introspection settings
+    gql_group = parser.add_mutually_exclusive_group()
+    gql_group.add_argument(
+        "--enable-graphql-introspection",
+        action="store_true",
+        default=None,
+        dest="enable_graphql_introspection",
+        help="Introspect Lambda plugin cf_*/FilterLookup fields at startup (default)",
+    )
+    gql_group.add_argument(
+        "--disable-graphql-introspection",
+        action="store_false",
+        dest="enable_graphql_introspection",
+        help="Skip GraphQL schema introspection at startup",
+    )
+
     # Observability settings
     parser.add_argument(
         "--log-level",
@@ -103,6 +119,8 @@ def parse_cli_args() -> dict[str, Any]:
         overlay["verify_ssl"] = args.verify_ssl
     if args.enable_plugin_discovery is not None:
         overlay["enable_plugin_discovery"] = args.enable_plugin_discovery
+    if args.enable_graphql_introspection is not None:
+        overlay["enable_graphql_introspection"] = args.enable_graphql_introspection
     if args.log_level is not None:
         overlay["log_level"] = args.log_level
 
@@ -336,7 +354,22 @@ def validate_filters(filters: dict, object_type: str | None = None) -> None:
 
 @mcp.tool(
     description="""
-    Get objects from NetBox based on their type and filters
+    Get objects from NetBox based on their type and filters (REST).
+
+    ⚠ PREFER GRAPHQL FOR READS. Use `netbox_graphql_query` first for almost all
+    read workloads. GraphQL:
+      - Enforces field selection (smaller payloads, lower token cost).
+      - Supports nested filtering across relations in one round-trip
+        (e.g., interface_templates by device_type.cf_lam_pn).
+      - Supports FilterLookup shapes for id / status (in_list, n_in_list, ...).
+      - Exposes Lambda plugin custom-field filters (`cf_*`) as first-class fields.
+      - Rejects unknown filters at validation — no silent-ignore footgun.
+    Use `netbox_graphql_introspect` to discover filter shapes.
+
+    Fall back to this REST tool only when:
+      - GraphQL is unavailable on the target instance.
+      - Endpoint exists only on REST (no GraphQL model).
+      - You explicitly need NetBox's REST-only query shape.
 
     SAFETY WARNING: NetBox REST API silently ignores unsupported filter parameters
     and returns ALL objects. This means a bad filter can cause you to operate on
@@ -475,7 +508,12 @@ def netbox_get_object_by_id(
     brief: bool = False,
 ):
     """
-    Get detailed information about a specific NetBox object by its ID.
+    Get detailed information about a specific NetBox object by its ID (REST).
+
+    ⚠ PREFER GRAPHQL FOR READS. Use `netbox_graphql_query` — e.g.
+        { device(id: "123") { id name site { slug } } }
+    to fetch exactly the fields you need. Fall back to this REST tool only when
+    GraphQL is unavailable or the endpoint has no GraphQL equivalent.
 
     Args:
         object_type: String representing the NetBox object type (e.g. "dcim.device", "ipam.ipaddress")
@@ -523,7 +561,10 @@ def netbox_get_object_by_id(
 @mcp.tool
 def netbox_get_changelogs(filters: dict):
     """
-    Get object change records (changelogs) from NetBox based on filters.
+    Get object change records (changelogs) from NetBox based on filters (REST).
+
+    ⚠ PREFER GRAPHQL FOR READS when the instance exposes `object_change_list`.
+    Fall back to this REST tool otherwise.
 
     Args:
         filters: dict of filters to apply to the API call based on the NetBox API filtering options
@@ -584,7 +625,12 @@ def netbox_get_changelogs(filters: dict):
 
 @mcp.tool(
     description="""
-    Perform global search across NetBox infrastructure.
+    Perform global search across NetBox infrastructure (REST).
+
+    ⚠ PREFER GRAPHQL FOR READS. For targeted lookups, `netbox_graphql_query`
+    with `icontains` / `in_list` filters is faster and returns exactly the
+    fields requested. Reach for this fan-out tool only when you genuinely
+    need the REST `q=` search behavior across many object types at once.
 
     Searches names, descriptions, IP addresses, serial numbers, asset tags,
     and other key fields across multiple object types.
@@ -672,6 +718,198 @@ def netbox_search_objects(
             continue
 
     return results
+
+
+@mcp.tool(
+    description="""
+    Execute a GraphQL query against NetBox's /graphql/ endpoint.
+
+    Use GraphQL when REST filters can't express the query — especially for:
+      - Nested filtering across relations (e.g., filter interface_templates by
+        device_type.cf_lam_pn, or devices by role.slug + site.slug together).
+      - Batch lookups by list of IDs (`id: { in_list: [...] }` on device/interface).
+      - Multi-status queries without OR-chaining (`status: { in_list: [...] }`).
+      - Fetching deeply nested objects in a single round-trip.
+      - Queries that exercise Lambda's `lambda` plugin custom filters.
+
+    Default to the REST tools (netbox_get_objects / _by_id / _search) for simple
+    lookups; reach for this tool when you need the shapes above.
+
+    =========================================================================
+    Lambda `lambda` plugin custom filters (available on Lambda NetBox only)
+    =========================================================================
+
+    Custom-field filters exposed as first-class `cf_<name>` fields on Strawberry
+    filter classes. All support lookups unless noted.
+
+    Text CFs (lookups: exact, icontains, starts_with, in_list, is_empty):
+      - cf_lam_pn              → DeviceType, ModuleType, RackType, ConsumableType
+      - cf_netsuite_internal_id→ DeviceType, ModuleType, RackType, Location,
+                                 ConsumableType
+      - cf_cluster_name        → Rack
+      - cf_scalable_unit       → Device
+
+    Select CFs (same lookup shape as text):
+      - cf_architecture        → DeviceType
+      - cf_spare_type          → Device, Asset  (values: "Cold", "Validated")
+
+    Object / multi-object CFs (nested slug/fqdn lookup):
+      - cf_logical_cluster     → Device, Prefix
+                                 shape: { slug: { exact|icontains|starts_with|in_list },
+                                          is_empty }
+      - cf_logical_clusters    → Rack, Location   (same shape as above)
+      - cf_dns_zone            → Prefix
+                                 shape: { fqdn: { exact|icontains|starts_with|in_list },
+                                          id, id_in, is_empty }
+
+    Rack boolean CFs (shape: { exact: true|false, is_empty: true|false }):
+      cf_has_power, cf_has_clean_power, cf_has_liquid_cooling,
+      cf_is_containment_complete, cf_is_edge_cabling_complete,
+      cf_is_in_band_cabling_complete, cf_is_infiniband_cabling_complete,
+      cf_is_liquid_cooling_operational, cf_is_maintenance_scheduled,
+      cf_is_out_of_band_cabling_complete
+
+    ID FilterLookup on DeviceFilter / InterfaceFilter (replaces bare ID scalar):
+      id: { exact: "123" } | id: { in_list: ["1","2","3"] } | id: { is_null: true }
+
+    Status FilterLookup on DeviceFilter (replaces scalar DeviceStatusEnum):
+      status: { exact: STATUS_ACTIVE }
+      status: { in_list: [STATUS_ACTIVE, STATUS_PLANNED] }
+      status: { n_exact: STATUS_DECOMMISSIONING }
+      status: { n_in_list: [STATUS_OFFLINE, STATUS_FAILED] }
+      Valid enums: STATUS_OFFLINE, STATUS_ACTIVE, STATUS_PLANNED, STATUS_STAGED,
+                   STATUS_FAILED, STATUS_INVENTORY, STATUS_DECOMMISSIONING
+
+    IPAddress-by-containing-prefix (resolved server-side via net_contained):
+      ip_address_list(filters: { cf_logical_cluster: { slug: { exact: "lax01-lm01" } } })
+      ip_address_list(filters: { cf_dns_zone: { fqdn: { in_list: [...] } } })
+
+    Nested filtering across relations (works with any cf_* and NetBox-native
+    StrFilterLookup slugs):
+      interface_template_list(filters: {
+        device_type: { cf_lam_pn: { in_list: ["223-000510", "223-000053"] } }
+      }) { id name }
+
+      device_list(filters: {
+        device_type: { slug: { in_list: ["sys-221he-tnr"] } }
+        role:        { slug: { in_list: ["switch", "core-switch"] } }
+      }) { id name }
+
+    =========================================================================
+    Performance
+    =========================================================================
+    - Pagination uses the `pagination` argument, NOT `limit`:
+        device_list(pagination: { limit: 100, offset: 0 }) { id name }
+    - Request only fields you need — NetBox serialization is heavy.
+    - Cable queries benefit from the plugin's MAC-address batching
+      (GenericPrefetch on cable terminations) — no caller change required.
+
+    =========================================================================
+    LIVE SCHEMA (auto-introspected at startup)
+    =========================================================================
+    [live-schema-placeholder]
+
+    =========================================================================
+    Gotchas
+    =========================================================================
+    - GraphQL rejects unknown filter fields at validation (unlike REST which
+      silently ignores) — treat that as a win, read the error.
+    - `is_empty: true` catches absent keys, JSON null, empty string, empty array.
+    - Object/multi-object CF filters resolve slug → ID server-side; a slug that
+      matches nothing returns zero rows, not an error.
+    - This tool returns ONLY the `data` block. GraphQL-level errors raise
+      ValueError with the concatenated messages.
+
+    Args:
+        query: GraphQL query document.
+        variables: Optional dict of variables referenced by the query.
+        operation_name: Optional operation name (required when the document
+                        defines multiple operations).
+
+    Returns:
+        The `data` portion of the GraphQL response as a dict.
+
+    Examples:
+        # Devices in a cluster (Lambda plugin)
+        netbox_graphql_query(
+            query='query($s: String!) { device_list(filters: {cf_logical_cluster: {slug: {exact: $s}}}) { id name } }',
+            variables={"s": "mci01-cl01"},
+        )
+
+        # Multi-status device lookup (Lambda plugin)
+        netbox_graphql_query(
+            query='{ device_list(filters: {status: {in_list: [STATUS_ACTIVE, STATUS_PLANNED]}}) { id name status } }',
+        )
+
+        # Device + interface batch by ID (Lambda plugin)
+        netbox_graphql_query(
+            query='{ device_list(filters: {id: {in_list: ["415","8746"]}}) { id name } }',
+        )
+    """
+)
+def netbox_graphql_query(
+    query: str,
+    variables: dict | None = None,
+    operation_name: str | None = None,
+) -> dict:
+    """Execute a GraphQL query against NetBox."""
+    return netbox.graphql(query=query, variables=variables, operation_name=operation_name)
+
+
+@mcp.tool(
+    description="""
+    Introspect NetBox's GraphQL schema for a type name.
+
+    Use this to discover what filter fields a given query accepts and what
+    shape each filter expects — especially for Lambda plugin cf_* filters,
+    FilterLookup inputs, and nested relation filters. Returns the fields of
+    the named type (OBJECT, INPUT_OBJECT, ENUM) with their types.
+
+    Typical names to introspect:
+      - Query object: "Query"                   (lists all top-level queries)
+      - Filter inputs: "DeviceFilter", "RackFilter", "InterfaceTemplateFilter",
+                       "PrefixFilter", "IPAddressFilter", "DeviceTypeFilter"
+      - Lookup inputs: "StrFilterLookup", "IntegerFilterLookup",
+                       "DeviceStatusEnumFilterLookup"
+      - Object types:  "DeviceType", "RackType", "InterfaceType"
+                       (GraphQL types, not NetBox DeviceType model)
+
+    Args:
+        type_name: GraphQL type name (case-sensitive).
+
+    Returns:
+        Dict with keys `name`, `kind`, `description`, and one of `fields`
+        (OBJECT/INTERFACE), `inputFields` (INPUT_OBJECT), or `enumValues`
+        (ENUM). Returns {"found": False, "name": type_name} if the type
+        does not exist.
+
+    Example:
+        # Discover DeviceFilter fields
+        netbox_graphql_introspect("DeviceFilter")
+
+        # Confirm FilterLookup shape
+        netbox_graphql_introspect("StrFilterLookup")
+    """
+)
+def netbox_graphql_introspect(type_name: str) -> dict:
+    """Introspect a GraphQL type by name."""
+    query = """
+    query($name: String!) {
+      __type(name: $name) {
+        name
+        kind
+        description
+        fields { name description type { name kind ofType { name kind } } }
+        inputFields { name description type { name kind ofType { name kind } } }
+        enumValues { name description }
+      }
+    }
+    """
+    data = netbox.graphql(query=query, variables={"name": type_name})
+    type_info = data.get("__type")
+    if type_info is None:
+        return {"found": False, "name": type_name}
+    return type_info
 
 
 def _get_endpoint_info(object_type: str) -> tuple[str, str | None]:
@@ -805,6 +1043,153 @@ def _update_tool_descriptions() -> None:
             tool.description = f"{prefix}\n\n{type_list}{suffix}"
 
 
+# Filter types scanned for Lambda plugin overrides / cf_* additions.
+# Missing types on non-Lambda NetBox resolve to null and are skipped silently.
+LAMBDA_FILTER_TARGETS: tuple[str, ...] = (
+    "DeviceFilter",
+    "RackFilter",
+    "LocationFilter",
+    "PrefixFilter",
+    "IPAddressFilter",
+    "DeviceTypeFilter",
+    "ModuleTypeFilter",
+    "RackTypeFilter",
+    "ConsumableTypeFilter",
+    "AssetFilter",
+    "InterfaceFilter",
+    "InterfaceTemplateFilter",
+)
+
+# Fields treated as "Lambda-interesting" — cf_* prefix plus the id/status
+# overrides the plugin swaps onto DeviceFilter/InterfaceFilter.
+_LAMBDA_OVERRIDE_FIELDS = frozenset({"id", "status"})
+
+
+def introspect_lambda_filters(client: NetBoxRestClient) -> str:
+    """Introspect Lambda plugin cf_* / FilterLookup fields across common filter types.
+
+    Batches one GraphQL request to scan all filter types for cf_* / overridden
+    id|status fields, then a second batched request to fetch each referenced
+    FilterLookup's inputFields (the actual lookup shape, e.g. exact/in_list/...).
+    Returns a compact, human-readable summary for injection into the
+    netbox_graphql_query tool description.
+
+    Args:
+        client: Initialized NetBox REST client (used for its graphql() method)
+
+    Returns:
+        Formatted multi-line summary, or empty string on failure / no matches.
+    """
+    logger = logging.getLogger(__name__)
+
+    # NetBox/Strawberry caps __type aliases per request (10 at time of writing).
+    # Keep chunks conservatively small.
+    alias_chunk = 8
+
+    def _batched(selections: list[str]) -> dict:
+        """Run multiple small __type batches and merge responses."""
+        merged: dict = {}
+        for i in range(0, len(selections), alias_chunk):
+            chunk = selections[i : i + alias_chunk]
+            merged.update(client.graphql("{ " + " ".join(chunk) + " }"))
+        return merged
+
+    try:
+        # Pass 1: scan filter types for cf_*/id/status fields and their lookup types
+        filter_aliases = {ft: ft.lower() for ft in LAMBDA_FILTER_TARGETS}
+        filter_selections = [
+            f'{alias}: __type(name: "{ft}") {{ inputFields {{ name type {{ name }} }} }}'
+            for ft, alias in filter_aliases.items()
+        ]
+        filter_data = _batched(filter_selections)
+
+        per_filter: dict[str, list[tuple[str, str]]] = {}
+        lookup_types: set[str] = set()
+        for ft, alias in filter_aliases.items():
+            info = filter_data.get(alias)
+            if not info:
+                continue
+            hits: list[tuple[str, str]] = []
+            for field in info.get("inputFields") or []:
+                name = field["name"]
+                if not (name.startswith("cf_") or name in _LAMBDA_OVERRIDE_FIELDS):
+                    continue
+                type_name = (field.get("type") or {}).get("name")
+                if not type_name:
+                    continue
+                hits.append((name, type_name))
+                lookup_types.add(type_name)
+            if hits:
+                per_filter[ft] = hits
+
+        if not per_filter:
+            return ""
+
+        # Pass 2: resolve FilterLookup shapes in batched requests
+        lookup_shapes: dict[str, list[str]] = {}
+        if lookup_types:
+            lookup_aliases = {lt: f"l{i}" for i, lt in enumerate(sorted(lookup_types))}
+            lookup_selections = [
+                f'{alias}: __type(name: "{lt}") {{ inputFields {{ name }} }}'
+                for lt, alias in lookup_aliases.items()
+            ]
+            lookup_data = _batched(lookup_selections)
+            for lt, alias in lookup_aliases.items():
+                info = lookup_data.get(alias)
+                if info and info.get("inputFields"):
+                    lookup_shapes[lt] = [f["name"] for f in info["inputFields"]]
+
+        # Drop id/status entries whose type is a bare scalar/enum (NetBox default,
+        # NOT a Lambda plugin FilterLookup override). Keep cf_* entries always.
+        cleaned: dict[str, list[tuple[str, str]]] = {}
+        for ft, hits in per_filter.items():
+            keep = [
+                (name, lt)
+                for name, lt in hits
+                if name.startswith("cf_") or lt in lookup_shapes
+            ]
+            if keep:
+                cleaned[ft] = keep
+
+        if not cleaned:
+            return ""
+
+        # Format summary
+        lines: list[str] = []
+        for ft in sorted(cleaned.keys()):
+            lines.append(f"{ft}:")
+            for field_name, lookup_type in cleaned[ft]:
+                shape = lookup_shapes.get(lookup_type)
+                shape_str = " {" + ", ".join(shape) + "}" if shape else ""
+                lines.append(f"  {field_name} → {lookup_type}{shape_str}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.warning(f"GraphQL introspection failed, keeping static description: {e}")
+        return ""
+
+
+def _update_graphql_tool_description(live_schema: str) -> None:
+    """Splice live-schema summary into the netbox_graphql_query tool description.
+
+    The sentinel `[live-schema-placeholder]` marks the insertion point. If no
+    summary was introspected, replace the sentinel (and its section header) with
+    a short "(introspection disabled or returned no Lambda plugin fields)" note.
+    """
+    tool = mcp._tool_manager._tools.get("netbox_graphql_query")
+    if not tool:
+        return
+    placeholder = "[live-schema-placeholder]"
+    if placeholder not in tool.description:
+        return
+    replacement = live_schema if live_schema else (
+        "(introspection disabled or returned no Lambda plugin fields — "
+        "fall back to the static reference above)"
+    )
+    tool.description = tool.description.replace(placeholder, replacement, 1)
+
+
 def main() -> None:
     """Main entry point for the MCP server."""
     global netbox
@@ -860,6 +1245,19 @@ def main() -> None:
         if plugin_types:
             NETBOX_OBJECT_TYPES.update(plugin_types)
             _update_tool_descriptions()
+
+    if settings.enable_graphql_introspection:
+        live_schema = introspect_lambda_filters(netbox)
+        if live_schema:
+            logger.info(
+                f"GraphQL introspection: discovered Lambda filters on "
+                f"{live_schema.count(chr(10) + '  ')} fields across "
+                f"{live_schema.count(chr(10)) - live_schema.count(chr(10) + '  ')} "
+                f"filter types"
+            )
+        _update_graphql_tool_description(live_schema)
+    else:
+        _update_graphql_tool_description("")
 
     try:
         if settings.transport == "stdio":

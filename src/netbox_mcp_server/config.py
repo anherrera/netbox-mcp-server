@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     enable_plugin_discovery: bool = False
     """Whether to auto-discover plugin object types from NetBox at startup"""
 
+    # ===== GraphQL Introspection Settings =====
+    enable_graphql_introspection: bool = True
+    """Whether to introspect Lambda-plugin cf_* / FilterLookup fields at startup
+    and inject them into the netbox_graphql_query tool description. Silently
+    no-ops on NetBox instances without the plugin."""
+
     # ===== Security Settings =====
     verify_ssl: bool = True
     """Whether to verify SSL certificates when connecting to NetBox"""
@@ -95,6 +101,7 @@ class Settings(BaseSettings):
             "port": self.port if self.transport == "http" else "N/A",
             "verify_ssl": self.verify_ssl,
             "enable_plugin_discovery": self.enable_plugin_discovery,
+            "enable_graphql_introspection": self.enable_graphql_introspection,
             "log_level": self.log_level,
         }
 
